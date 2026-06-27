@@ -37,7 +37,7 @@ SETTINGS_FILE = "settings.json"
 
 
 def load_settings():
-    defaults = {"simultaneous_download": False}
+    defaults = {"simultaneous_download": False, "simultaneous_count": 3}
     try:
         with open(SETTINGS_FILE, 'r') as f:
             defaults.update(json.load(f))
@@ -201,10 +201,11 @@ class DownloaderWorker(QtCore.QThread):
     link_failed_signal = QtCore.pyqtSignal(str)
     error_signal = QtCore.pyqtSignal(str)
 
-    def __init__(self, links, simultaneous=False, parent=None):
+    def __init__(self, links, simultaneous=False, simultaneous_count=3, parent=None):
         super().__init__(parent)
         self.links = links
         self.simultaneous = simultaneous
+        self.simultaneous_count = max(1, simultaneous_count)
         self._is_paused = False
         self._lock = QtCore.QMutex()
         self.active = True
@@ -226,7 +227,10 @@ class DownloaderWorker(QtCore.QThread):
         self.terminate()
 
     def run(self):
-        mode = "simultaneous" if self.simultaneous else "sequential"
+        if self.simultaneous:
+            mode = f"simultaneous  ×{self.simultaneous_count}"
+        else:
+            mode = "sequential"
         self.log_signal.emit(f"🚀 Starting download session  [{mode} mode]")
         start_session = time.time()
         links = self.links.copy()
@@ -260,10 +264,12 @@ class DownloaderWorker(QtCore.QThread):
             ordered = [lnk for lnk in links if lnk in resolved]
 
             if self.simultaneous:
-                self.log_signal.emit(f"⬇️ Downloading {total} files simultaneously...")
-                self.status_signal.emit("Downloading (simultaneous)...")
+                self.log_signal.emit(
+                    f"⬇️ Downloading {total} files simultaneously ({self.simultaneous_count} at a time)..."
+                )
+                self.status_signal.emit(f"Downloading (×{self.simultaneous_count})...")
 
-                with ThreadPoolExecutor(max_workers=4) as ex:
+                with ThreadPoolExecutor(max_workers=self.simultaneous_count) as ex:
                     futs = {
                         ex.submit(self._download_one, lnk, fn, url, i + 1, total): lnk
                         for i, lnk in enumerate(ordered)
@@ -526,7 +532,7 @@ class SettingsDialog(QtWidgets.QDialog):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("⚙️ Settings")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(400)
         self.setModal(True)
         self.settings = dict(settings)
 
@@ -536,25 +542,42 @@ class SettingsDialog(QtWidgets.QDialog):
         # Download mode group
         group = QtWidgets.QGroupBox("Download Mode")
         group_layout = QtWidgets.QVBoxLayout(group)
-        group_layout.setSpacing(8)
+        group_layout.setSpacing(10)
 
         self.seq_radio = QtWidgets.QRadioButton("Sequential — one file at a time  (Recommended)")
-        self.sim_radio = QtWidgets.QRadioButton("Simultaneous — all files at once")
 
-        if self.settings.get("simultaneous_download", False):
-            self.sim_radio.setChecked(True)
-        else:
-            self.seq_radio.setChecked(True)
+        # Simultaneous row: radio + label + spinbox
+        sim_row = QtWidgets.QHBoxLayout()
+        self.sim_radio = QtWidgets.QRadioButton("Simultaneous —")
+        self.count_spin = QtWidgets.QSpinBox()
+        self.count_spin.setRange(1, 20)
+        self.count_spin.setSpecialValueText("3")   # shown when value == minimum (1) is not used here
+        saved_count = self.settings.get("simultaneous_count", 3)
+        self.count_spin.setValue(saved_count if saved_count else 3)
+        self.count_spin.setFixedWidth(55)
+        self.count_spin.setToolTip("Number of files to download at the same time (default: 3)")
+        sim_label = QtWidgets.QLabel("files at once")
+        sim_row.addWidget(self.sim_radio)
+        sim_row.addWidget(self.count_spin)
+        sim_row.addWidget(sim_label)
+        sim_row.addStretch()
+
+        is_sim = self.settings.get("simultaneous_download", False)
+        self.sim_radio.setChecked(is_sim)
+        self.seq_radio.setChecked(not is_sim)
+        self.count_spin.setEnabled(is_sim)
+
+        self.sim_radio.toggled.connect(self.count_spin.setEnabled)
 
         note = QtWidgets.QLabel(
             "Sequential gives each file the full connection bandwidth.\n"
-            "Simultaneous splits bandwidth across all active downloads."
+            "Simultaneous splits bandwidth — leave the count blank to use 3."
         )
         note.setWordWrap(True)
-        note.setStyleSheet("color: #888; font-size: 11px; padding-top: 4px;")
+        note.setStyleSheet("color: #888; font-size: 11px; padding-top: 2px;")
 
         group_layout.addWidget(self.seq_radio)
-        group_layout.addWidget(self.sim_radio)
+        group_layout.addLayout(sim_row)
         group_layout.addWidget(note)
         layout.addWidget(group)
 
@@ -570,6 +593,7 @@ class SettingsDialog(QtWidgets.QDialog):
 
     def _save(self):
         self.settings["simultaneous_download"] = self.sim_radio.isChecked()
+        self.settings["simultaneous_count"] = self.count_spin.value() or 3
         save_settings(self.settings)
         self.accept()
 
@@ -897,9 +921,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         simultaneous = self.settings.get("simultaneous_download", False)
-        mode_label = "simultaneous" if simultaneous else "sequential"
+        sim_count = self.settings.get("simultaneous_count", 3) or 3
+        if simultaneous:
+            mode_label = f"simultaneous ×{sim_count}"
+        else:
+            mode_label = "sequential"
         self.log(f"📋 Download mode: {mode_label}")
-        self.worker = DownloaderWorker(links, simultaneous=simultaneous)
+        self.worker = DownloaderWorker(links, simultaneous=simultaneous, simultaneous_count=sim_count)
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.file_signal.connect(self.update_file)
@@ -949,7 +977,11 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = SettingsDialog(self.settings, parent=self)
         if dialog.exec_() == QtWidgets.QDialog.Accepted:
             self.settings = dialog.get_settings()
-            mode = "simultaneous" if self.settings.get("simultaneous_download") else "sequential"
+            if self.settings.get("simultaneous_download"):
+                count = self.settings.get("simultaneous_count", 3) or 3
+                mode = f"simultaneous ×{count}"
+            else:
+                mode = "sequential"
             self.log(f"⚙️ Settings saved — download mode: {mode}")
 
     def export_for_fdm(self):
