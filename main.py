@@ -233,25 +233,22 @@ class DownloaderWorker(QtCore.QThread):
             if not resolved or not self.active:
                 return
 
-            # Phase 2: download all resolved files simultaneously (max 4 at once)
-            self.log_signal.emit(f"⬇️ Downloading {len(resolved)} files simultaneously...")
+            # Phase 2: download files one by one to maximize per-file speed
+            self.log_signal.emit(f"⬇️ Downloading {len(resolved)} files one by one...")
             self.status_signal.emit("Downloading...")
 
-            with ThreadPoolExecutor(max_workers=4) as ex:
-                futs = {
-                    ex.submit(self._download_one, lnk, fn, url): lnk
-                    for lnk, (fn, url) in resolved.items()
-                }
-                for fut in as_completed(futs):
-                    if not self.active:
-                        break
-                    lnk = futs[fut]
-                    try:
-                        fut.result()
-                        self.link_removed_signal.emit(lnk)
-                    except Exception as e:
-                        self.link_failed_signal.emit(lnk)
-                        self.log_signal.emit(f"❌ Download failed: {lnk[:60]}\n   {e}")
+            for lnk in links:
+                if not self.active:
+                    break
+                if lnk not in resolved:
+                    continue
+                fn, url = resolved[lnk]
+                try:
+                    self._download_one(lnk, fn, url)
+                    self.link_removed_signal.emit(lnk)
+                except Exception as e:
+                    self.link_failed_signal.emit(lnk)
+                    self.log_signal.emit(f"❌ Download failed: {lnk[:60]}\n   {e}")
 
         finally:
             elapsed = time.time() - start_session
