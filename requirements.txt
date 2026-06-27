@@ -3,6 +3,7 @@ PyQt5
 qt-material
 requests
 beautifulsoup4
+playwright
 
 # Optional (For Building)
 pyinstaller
