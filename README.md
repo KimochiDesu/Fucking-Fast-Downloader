@@ -4,156 +4,136 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=flat&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/riteshp2001/e/367661)
 
-A modern GUI application for downloading Fucking Fast Links with pause/resume functionality and progress tracking.
+A modern GUI application for downloading files from FuckingFast.co links with pause/resume, real-time progress tracking, and Free Download Manager export.
 
 ![Application Preview](/preview/preview.png)
 
 ## Features ✨
-- **Modern Dark Theme** 🌙  
-- **Pause/Resume Downloads** ⏯️  
-- **Real-Time Speed Tracking** 🚀  
-- **Automatic Link Management** 🔄  
-- **Multi-Platform Support** 💻  
-- **Progress Visualization** 📊  
-- **Error Handling & Retry** ❗  
-- **Custom Icons & Styling** 🎨  
 
-## Installation 🛠️
+- **Headless URL Resolution** 🤖 — Uses Playwright to bypass JS-protected download pages automatically
+- **Modern Dark Theme** 🌙
+- **Pause/Resume Downloads** ⏯️
+- **Real-Time Speed & Progress** 🚀 — Per-file `[N/total]` tracking in the console
+- **Sequential or Simultaneous Downloads** ⚙️ — Toggle in Settings (sequential recommended for max speed)
+- **Parallel URL Resolution** ⚡ — Resolves all links at once while downloading one by one
+- **Export URLs for FDM** 📋 — Saves resolved CDN URLs to `output_links.txt` for Free Download Manager
+- **Automatic Link Management** 🔄 — Completed links removed from queue; failed links highlighted red
+- **Error Handling & Retry** ❗
+
+## Requirements 🛠️
+
+- Python 3.10+
+- Playwright + Chromium (for JS-rendered download page support)
+
+## Installation
+
 ```bash
-# Clone repository
-git clone https://github.com/Riteshp2001/Fucking-Fast-Downloader
+# Clone this fork
+git clone https://github.com/KimochiDesu/Fucking-Fast-Downloader
 cd Fucking-Fast-Downloader
 
-# Install dependencies
+# Install Python dependencies
 pip install -r requirements.txt
+
+# Install Playwright and download Chromium (one-time setup)
+pip install playwright
+playwright install chromium
 ```
 
 ## Usage Guide 📖
-1. Add links to `input.txt`:
+
+1. Add your FuckingFast.co links to `input.txt` (one link per line):
+   ```
+   https://fuckingfast.co/abc123#MyFile.part01.rar
+   https://fuckingfast.co/def456#MyFile.part02.rar
+   ```
+
 2. Launch the application:
    ```bash
    python main.py
    ```
-3. Click **Load Links** → **Download All**
+
+3. Click **Load Links** to import from `input.txt`
+
+4. *(Optional)* Click **⚙️ Settings** to choose download mode:
+   - **Sequential** *(default)* — downloads one file at a time for maximum speed per file
+   - **Simultaneous** — downloads all files at once, splitting your bandwidth
+
+5. Click **Download All** to start — the console shows live `[N/total]` progress per file
+
+### Export to Free Download Manager 📋
+
+1. Load your links
+2. Click **📋 Export URLs for FDM**  
+   — The app resolves all links in parallel and writes real CDN URLs to `output_links.txt`
+3. In FDM: **Import → From a text file** → select `output_links.txt`
+
+## Settings ⚙️
+
+Settings are saved to `settings.json` in the app directory.
+
+| Setting | Default | Description |
+|---|---|---|
+| `simultaneous_download` | `false` | Download all files at once instead of one by one |
 
 ## Build Executable 🏗️
-1. Add build.spec file in folder directory 
-2. Copy paste this spec file template:
-```bash
+
+1. Create `build.spec` in the project folder:
+
+```python
 # -*- mode: python ; coding: utf-8 -*-
-
-block_cipher = None
-
-import sys
-import os
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.building.build_main import PYZ, EXE, COLLECT
 
-# Application name and version
-APP_NAME = 'Test Application'
-APP_VERSION = '1.0'
+block_cipher = None
+APP_NAME = 'Fucking Fast Downloader'
+APP_VERSION = '2.0'
+ICON_PATH = 'icons/fuckingfast.ico'
 
-# Platform-specific configurations
-if sys.platform == 'win32':
-    ICON_PATH = os.path.join('icons', 'fuckingfasticon.ico')
-
-# List of data files to include
 data_files = []
-
-# Collect qt_material files
 data_files.extend(collect_data_files('qt_material'))
-
-# Application icons
-data_files.append((ICON_PATH, 'iconfoldername'))
-data_files.append((os.path.join('iconfoldername', 'test.png'), 'iconfoldername'))
-
-# Required files
+data_files.append((ICON_PATH, 'icons'))
+data_files.append(('icons/github.png', 'icons'))
+data_files.append(('icons/buymecoffee.png', 'icons'))
 data_files.append(('input.txt', '.'))
-
-# Windows specific DLLs
-if sys.platform == 'win32':
-    dll_path = os.path.join(sys.base_prefix, 'DLLs', 'libcrypto-1_1.dll')
-    if os.path.exists(dll_path):
-        data_files.append((dll_path, '.'))
-
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
     datas=data_files,
-    hiddenimports=[
-        'PyQt5.sip',
-        'bs4',
-        'requests'
-    ],
+    hiddenimports=['PyQt5.sip', 'bs4', 'requests', 'playwright'],
     hookspath=[],
-    hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
     cipher=block_cipher,
-    noarchive=False
 )
 
-# Executable configuration
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    [],
+    pyz, a.scripts, a.binaries, a.zipfiles, a.datas, [],
     name=APP_NAME,
     debug=False,
-    bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
     icon=ICON_PATH,
-    version_info={
-        'CompanyName': 'CompanyName',
-        'FileDescription': APP_NAME,
-        'ProductName': APP_NAME,
-        'ProductVersion': APP_VERSION,
-        'OriginalFilename': APP_NAME + '.exe'
-    }
-)
-
-# Collect build artifacts
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name=APP_NAME
 )
 ```
 
-3. In Terminal type :
-```bash
-pyinstaller build.spec
-```
+2. Build:
+   ```bash
+   pyinstaller build.spec
+   ```
 
-## Support Development ☕  
+## Support Development ☕
+
 Help keep this project updated:  
 [![Buy Me A Coffee](https://img.shields.io/badge/Support-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/riteshp2001/e/367661)
 
 ---
 
-**Disclaimer**: This tool is unofficial and not affiliated with Fucking Fast. Always verify game ownership before downloading.
+**Disclaimer**: This tool is unofficial and not affiliated with FuckingFast. Always verify game ownership before downloading.
 
-*Created with ❤️ by [Ritesh Pandit](https://riteshpandit.vercel.app)*  
+*Original project by [Ritesh Pandit](https://riteshpandit.vercel.app) — forked and extended by [KimochiDesu](https://github.com/KimochiDesu)*

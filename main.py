@@ -13,6 +13,7 @@ Usage:
 import os
 import re
 import sys
+import json
 import time
 import threading
 import webbrowser
@@ -32,6 +33,25 @@ from qt_material import apply_stylesheet
 # Global configuration
 INPUT_FILE = "input.txt"
 DOWNLOADS_FOLDER = "downloads"
+SETTINGS_FILE = "settings.json"
+
+
+def load_settings():
+    defaults = {"simultaneous_download": False}
+    try:
+        with open(SETTINGS_FILE, 'r') as f:
+            defaults.update(json.load(f))
+    except Exception:
+        pass
+    return defaults
+
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(settings, f, indent=2)
+    except Exception:
+        pass
 
 if not os.path.exists(DOWNLOADS_FOLDER):
     os.makedirs(DOWNLOADS_FOLDER)
@@ -181,9 +201,10 @@ class DownloaderWorker(QtCore.QThread):
     link_failed_signal = QtCore.pyqtSignal(str)
     error_signal = QtCore.pyqtSignal(str)
 
-    def __init__(self, links, parent=None):
+    def __init__(self, links, simultaneous=False, parent=None):
         super().__init__(parent)
         self.links = links
+        self.simultaneous = simultaneous
         self._is_paused = False
         self._lock = QtCore.QMutex()
         self.active = True
@@ -205,57 +226,79 @@ class DownloaderWorker(QtCore.QThread):
         self.terminate()
 
     def run(self):
-        """Resolve all URLs in parallel, then download all files simultaneously."""
-        self.log_signal.emit("🚀 Starting download session")
+        mode = "simultaneous" if self.simultaneous else "sequential"
+        self.log_signal.emit(f"🚀 Starting download session  [{mode} mode]")
         start_session = time.time()
         links = self.links.copy()
 
         try:
             # Phase 1: resolve all CDN URLs in parallel (max 3 browser instances)
-            self.log_signal.emit(f"🔍 Resolving {len(links)} URLs simultaneously...")
+            self.log_signal.emit(f"🔍 Resolving {len(links)} URLs in parallel...")
             self.status_signal.emit("Resolving URLs...")
             resolved = {}  # link -> (filename, cdn_url)
 
             with ThreadPoolExecutor(max_workers=3) as ex:
                 futs = {ex.submit(resolve_cdn_url, lnk): lnk for lnk in links}
+                done = 0
                 for fut in as_completed(futs):
                     if not self.active:
                         break
                     lnk = futs[fut]
+                    done += 1
                     try:
                         fname, cdn = fut.result()
                         resolved[lnk] = (fname, cdn)
-                        self.log_signal.emit(f"✅ Resolved: {fname}")
+                        self.log_signal.emit(f"🔗 [{done}/{len(links)}] Resolved: {fname}")
                     except Exception as e:
                         self.link_failed_signal.emit(lnk)
-                        self.log_signal.emit(f"❌ Resolve failed: {lnk[:60]}\n   {e}")
+                        self.log_signal.emit(f"❌ [{done}/{len(links)}] Resolve failed: {lnk[:60]}\n   {e}")
 
             if not resolved or not self.active:
                 return
 
-            # Phase 2: download files one by one to maximize per-file speed
-            self.log_signal.emit(f"⬇️ Downloading {len(resolved)} files one by one...")
-            self.status_signal.emit("Downloading...")
+            total = len(resolved)
+            ordered = [lnk for lnk in links if lnk in resolved]
 
-            for lnk in links:
-                if not self.active:
-                    break
-                if lnk not in resolved:
-                    continue
-                fn, url = resolved[lnk]
-                try:
-                    self._download_one(lnk, fn, url)
-                    self.link_removed_signal.emit(lnk)
-                except Exception as e:
-                    self.link_failed_signal.emit(lnk)
-                    self.log_signal.emit(f"❌ Download failed: {lnk[:60]}\n   {e}")
+            if self.simultaneous:
+                self.log_signal.emit(f"⬇️ Downloading {total} files simultaneously...")
+                self.status_signal.emit("Downloading (simultaneous)...")
+
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    futs = {
+                        ex.submit(self._download_one, lnk, fn, url, i + 1, total): lnk
+                        for i, lnk in enumerate(ordered)
+                        for fn, url in [resolved[lnk]]
+                    }
+                    for fut in as_completed(futs):
+                        if not self.active:
+                            break
+                        lnk = futs[fut]
+                        try:
+                            fut.result()
+                            self.link_removed_signal.emit(lnk)
+                        except Exception as e:
+                            self.link_failed_signal.emit(lnk)
+                            self.log_signal.emit(f"❌ Download failed: {lnk[:60]}\n   {e}")
+            else:
+                self.log_signal.emit(f"⬇️ Downloading {total} files one by one...")
+                self.status_signal.emit("Downloading...")
+
+                for idx, lnk in enumerate(ordered, 1):
+                    if not self.active:
+                        break
+                    fn, url = resolved[lnk]
+                    try:
+                        self._download_one(lnk, fn, url, idx, total)
+                        self.link_removed_signal.emit(lnk)
+                    except Exception as e:
+                        self.link_failed_signal.emit(lnk)
+                        self.log_signal.emit(f"❌ [{idx}/{total}] Download failed: {lnk[:60]}\n   {e}")
 
         finally:
             elapsed = time.time() - start_session
             self.log_signal.emit(
                 f"🏁 Session finished\n"
-                f"   Duration: {elapsed:.1f}s\n"
-                f"   Processed: {len(links)} files"
+                f"   Duration: {elapsed:.1f}s  |  Files: {len(links)}"
             )
             self.status_signal.emit("Idle")
 
@@ -398,16 +441,20 @@ class DownloaderWorker(QtCore.QThread):
                 )
                 time.sleep(1.5 ** attempt)
 
-    def _download_one(self, link, file_name, download_url):
+    def _download_one(self, link, file_name, download_url, idx=1, total=1):
         """Download a single file. All state is local so this is safe to run concurrently."""
         output_path = os.path.join(DOWNLOADS_FOLDER, file_name)
-        self.file_signal.emit(file_name)
+        self.file_signal.emit(f"[{idx}/{total}] {file_name}")
+        self.log_signal.emit(f"⬇️ [{idx}/{total}] Downloading: {file_name}")
         dl_start = time.time()
         downloaded = 0
 
         with requests.get(download_url, headers=HEADERS, stream=True, timeout=30) as resp:
             resp.raise_for_status()
             total_size = int(resp.headers.get('content-length', 0))
+            size_mb = total_size / 1024 / 1024
+            if total_size:
+                self.log_signal.emit(f"📦 [{idx}/{total}] Size: {size_mb:.1f} MB")
 
             with open(output_path, 'wb') as f:
                 for chunk in resp.iter_content(1024 * 1024):
@@ -425,8 +472,7 @@ class DownloaderWorker(QtCore.QThread):
 
         elapsed = time.time() - dl_start
         self.log_signal.emit(
-            f"✅ Completed: {file_name}\n"
-            f"   Time: {elapsed:.1f}s  |  Path: {output_path}"
+            f"✅ [{idx}/{total}] Completed: {file_name}  ({elapsed:.1f}s)"
         )
 
     def download_file(self, url, path):
@@ -474,6 +520,61 @@ class DownloaderWorker(QtCore.QThread):
     def wait_while_paused(self):
         while self.should_pause() and self.active:
             time.sleep(0.1)
+
+
+class SettingsDialog(QtWidgets.QDialog):
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚙️ Settings")
+        self.setMinimumWidth(380)
+        self.setModal(True)
+        self.settings = dict(settings)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        # Download mode group
+        group = QtWidgets.QGroupBox("Download Mode")
+        group_layout = QtWidgets.QVBoxLayout(group)
+        group_layout.setSpacing(8)
+
+        self.seq_radio = QtWidgets.QRadioButton("Sequential — one file at a time  (Recommended)")
+        self.sim_radio = QtWidgets.QRadioButton("Simultaneous — all files at once")
+
+        if self.settings.get("simultaneous_download", False):
+            self.sim_radio.setChecked(True)
+        else:
+            self.seq_radio.setChecked(True)
+
+        note = QtWidgets.QLabel(
+            "Sequential gives each file the full connection bandwidth.\n"
+            "Simultaneous splits bandwidth across all active downloads."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #888; font-size: 11px; padding-top: 4px;")
+
+        group_layout.addWidget(self.seq_radio)
+        group_layout.addWidget(self.sim_radio)
+        group_layout.addWidget(note)
+        layout.addWidget(group)
+
+        # Buttons
+        btn_layout = QtWidgets.QHBoxLayout()
+        save_btn = QtWidgets.QPushButton("Save")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        save_btn.clicked.connect(self._save)
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(save_btn)
+        btn_layout.addWidget(cancel_btn)
+        layout.addLayout(btn_layout)
+
+    def _save(self):
+        self.settings["simultaneous_download"] = self.sim_radio.isChecked()
+        save_settings(self.settings)
+        self.accept()
+
+    def get_settings(self):
+        return self.settings
 
 
 class URLExportWorker(QtCore.QThread):
@@ -550,6 +651,8 @@ class MainWindow(QtWidgets.QMainWindow):
         nice_font = "Roboto" if "Roboto" in QFontDatabase().families() else "Segoe UI"
         QtWidgets.QApplication.setFont(QFont(nice_font, 10))
 
+        self.settings = load_settings()
+
         # Top buttons.
         top_button_layout = QtWidgets.QHBoxLayout()
         self.load_btn = QtWidgets.QPushButton("Load Links")
@@ -560,9 +663,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "Resolve all links to real CDN URLs and save to output_links.txt.\n"
             "Then import that file into Free Download Manager."
         )
+        self.settings_btn = QtWidgets.QPushButton("⚙️ Settings")
+        self.settings_btn.setObjectName("settings_btn")
         top_button_layout.addWidget(self.load_btn)
         top_button_layout.addWidget(self.download_btn)
         top_button_layout.addWidget(self.export_fdm_btn)
+        top_button_layout.addWidget(self.settings_btn)
         main_layout.addLayout(top_button_layout)
 
         # Main content layout.
@@ -681,6 +787,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_btn.setCursor(Qt.PointingHandCursor)
         self.download_btn.setCursor(Qt.PointingHandCursor)
         self.export_fdm_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
         self.pause_btn.setCursor(Qt.PointingHandCursor)
         self.resume_btn.setCursor(Qt.PointingHandCursor)
         self.github_button.setCursor(Qt.PointingHandCursor)
@@ -709,6 +816,8 @@ class MainWindow(QtWidgets.QMainWindow):
             QPushButton#export_fdm_btn { background-color: #7B2FBE; }
             QPushButton#export_fdm_btn:hover { background-color: #9B4FDE; }
             QPushButton#export_fdm_btn:disabled { background-color: #4A1F7A; color: #888; }
+            QPushButton#settings_btn { background-color: #455A64; }
+            QPushButton#settings_btn:hover { background-color: #607D8B; }
             QListWidget {
                 background-color: #1E1E1E;
                 color: #FFFFFF;
@@ -740,6 +849,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.load_btn.clicked.connect(self.load_links)
         self.download_btn.clicked.connect(self.download_all)
         self.export_fdm_btn.clicked.connect(self.export_for_fdm)
+        self.settings_btn.clicked.connect(self.open_settings)
         self.pause_btn.clicked.connect(self.pause_download)
         self.resume_btn.clicked.connect(self.resume_download)
 
@@ -786,7 +896,10 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "Info", "No links to download.")
             return
 
-        self.worker = DownloaderWorker(links)
+        simultaneous = self.settings.get("simultaneous_download", False)
+        mode_label = "simultaneous" if simultaneous else "sequential"
+        self.log(f"📋 Download mode: {mode_label}")
+        self.worker = DownloaderWorker(links, simultaneous=simultaneous)
         self.worker.log_signal.connect(self.log)
         self.worker.progress_signal.connect(self.update_progress)
         self.worker.file_signal.connect(self.update_file)
@@ -831,6 +944,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if self.worker:
             self.worker.stop()
+
+    def open_settings(self):
+        dialog = SettingsDialog(self.settings, parent=self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            self.settings = dialog.get_settings()
+            mode = "simultaneous" if self.settings.get("simultaneous_download") else "sequential"
+            self.log(f"⚙️ Settings saved — download mode: {mode}")
 
     def export_for_fdm(self):
         links = []
