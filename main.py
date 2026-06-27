@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+import threading
 import webbrowser
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -92,6 +93,80 @@ def colorize_log_message(message):
 
     return f"<span style='color:{color};'>{emoji}{message}</span>"
 
+def resolve_cdn_url(link):
+    """Resolve a fuckingfast.co link to (filename, cdn_url) using a headless browser.
+    The site executes JS to call window.open() with the real CDN URL; we intercept that."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        raise Exception(
+            "playwright not installed. Run: pip install playwright && playwright install chromium"
+        )
+
+    page_url = link.split('#')[0]
+    captured = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(user_agent=HEADERS['user-agent'])
+        page = ctx.new_page()
+        page.expose_function('_captureWindowOpen', lambda u: captured.append(u))
+        page.add_init_script("""
+            const _orig = window.open;
+            window.open = function(url, ...args) {
+                if (url) window._captureWindowOpen(String(url));
+                return _orig.apply(this, [url, ...args]);
+            };
+        """)
+        try:
+            page.goto(page_url, wait_until='domcontentloaded', timeout=30000)
+            page.wait_for_timeout(1500)
+
+            content = page.content()
+            soup = BeautifulSoup(content, 'html.parser')
+
+            download_url = None
+            for script in soup.find_all('script'):
+                text = script.string or ''
+                m = re.search(r'window\.open\(["\']?(https?://[^\s"\')\]]+)', text)
+                if m:
+                    download_url = m.group(1)
+                    break
+
+            if not download_url:
+                for sel in [
+                    '#download', '.download-btn', '[id*="download"]',
+                    'a[download]', 'button:text("Download")', 'a:text("Download")',
+                ]:
+                    try:
+                        btn = page.query_selector(sel)
+                        if btn:
+                            btn.click()
+                            page.wait_for_timeout(2000)
+                            break
+                    except Exception:
+                        continue
+
+            if captured:
+                download_url = captured[0]
+
+            if not download_url:
+                raise Exception("Could not find download URL on page")
+
+            try:
+                meta = soup.find('meta', {'name': 'title'})
+                if meta and meta.get('content'):
+                    filename = re.sub(r'[\\/*?:"<>|]', "", meta['content'])
+                else:
+                    filename = os.path.basename(page_url.rstrip('/')).split('?')[0][:120] or 'download'
+            except Exception:
+                filename = 'download'
+
+            return filename, download_url
+        finally:
+            browser.close()
+
+
 # ----------------------- GUI Code -----------------------
 class DownloaderWorker(QtCore.QThread):
     """
@@ -130,51 +205,62 @@ class DownloaderWorker(QtCore.QThread):
         self.terminate()
 
     def run(self):
-            """Main thread entry point with detailed logging"""
-            self.log_signal.emit("🚀 Starting download session")
-            start_session = time.time()
-            
-            try:
-                for idx, link in enumerate(self.links.copy(), 1):
+        """Resolve all URLs in parallel, then download all files simultaneously."""
+        self.log_signal.emit("🚀 Starting download session")
+        start_session = time.time()
+        links = self.links.copy()
+
+        try:
+            # Phase 1: resolve all CDN URLs in parallel (max 3 browser instances)
+            self.log_signal.emit(f"🔍 Resolving {len(links)} URLs simultaneously...")
+            self.status_signal.emit("Resolving URLs...")
+            resolved = {}  # link -> (filename, cdn_url)
+
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                futs = {ex.submit(resolve_cdn_url, lnk): lnk for lnk in links}
+                for fut in as_completed(futs):
                     if not self.active:
                         break
-                    
-                    self.log_signal.emit(
-                        f"🔗 Processing link {idx}/{len(self.links)}\n"
-                        f"   URL: {link[:70]}{'...' if len(link) > 70 else ''}"
-                    )
-                    
+                    lnk = futs[fut]
                     try:
-                        file_name, download_url = self.process_link(link)
-                        output_path = os.path.join(DOWNLOADS_FOLDER, file_name)
-                        
-                        self.log_signal.emit(
-                            f"📁 File identified\n"
-                            f"   Name: {file_name}\n"
-                            f"   Size: {self.get_remote_size(download_url)} MB"
-                        )
-                        
-                        dl_start = time.time()
-                        self.download_file(download_url, output_path)
-                        
-                        self.log_signal.emit(
-                            f"✅ Download completed\n"
-                            f"   Time: {time.time() - dl_start:.1f}s\n"
-                            f"   Path: {output_path}"
-                        )
-                        
-                        self.link_removed_signal.emit(link)
-                    
+                        fname, cdn = fut.result()
+                        resolved[lnk] = (fname, cdn)
+                        self.log_signal.emit(f"✅ Resolved: {fname}")
                     except Exception as e:
-                        self.link_failed_signal.emit(link)
+                        self.link_failed_signal.emit(lnk)
+                        self.log_signal.emit(f"❌ Resolve failed: {lnk[:60]}\n   {e}")
 
-            finally:
-                total_time = time.time() - start_session
-                self.log_signal.emit(
-                    f"🏁 Session finished\n"
-                    f"   Duration: {total_time:.1f}s\n"
-                    f"   Processed: {len(self.links)} files"
-                )
+            if not resolved or not self.active:
+                return
+
+            # Phase 2: download all resolved files simultaneously (max 4 at once)
+            self.log_signal.emit(f"⬇️ Downloading {len(resolved)} files simultaneously...")
+            self.status_signal.emit("Downloading...")
+
+            with ThreadPoolExecutor(max_workers=4) as ex:
+                futs = {
+                    ex.submit(self._download_one, lnk, fn, url): lnk
+                    for lnk, (fn, url) in resolved.items()
+                }
+                for fut in as_completed(futs):
+                    if not self.active:
+                        break
+                    lnk = futs[fut]
+                    try:
+                        fut.result()
+                        self.link_removed_signal.emit(lnk)
+                    except Exception as e:
+                        self.link_failed_signal.emit(lnk)
+                        self.log_signal.emit(f"❌ Download failed: {lnk[:60]}\n   {e}")
+
+        finally:
+            elapsed = time.time() - start_session
+            self.log_signal.emit(
+                f"🏁 Session finished\n"
+                f"   Duration: {elapsed:.1f}s\n"
+                f"   Processed: {len(links)} files"
+            )
+            self.status_signal.emit("Idle")
 
     def get_remote_size(self, url):
         """Get file size in megabytes"""
@@ -315,70 +401,36 @@ class DownloaderWorker(QtCore.QThread):
                 )
                 time.sleep(1.5 ** attempt)
 
-    def process_link(self, link):
-        """Resolve the real CDN download URL using a headless browser.
-        fuckingfast.co requires JS to reveal the URL via window.open()."""
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            raise Exception(
-                "playwright is not installed.\n"
-                "Run: pip install playwright && playwright install chromium"
-            )
+    def _download_one(self, link, file_name, download_url):
+        """Download a single file. All state is local so this is safe to run concurrently."""
+        output_path = os.path.join(DOWNLOADS_FOLDER, file_name)
+        self.file_signal.emit(file_name)
+        dl_start = time.time()
+        downloaded = 0
 
-        page_url = link.split('#')[0]  # fragments are never sent to the server
-        captured: list[str] = []
+        with requests.get(download_url, headers=HEADERS, stream=True, timeout=30) as resp:
+            resp.raise_for_status()
+            total_size = int(resp.headers.get('content-length', 0))
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=HEADERS['user-agent'])
-            page = context.new_page()
+            with open(output_path, 'wb') as f:
+                for chunk in resp.iter_content(1024 * 1024):
+                    if not self.active:
+                        return
+                    while self.should_pause() and self.active:
+                        time.sleep(0.1)
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    elapsed = time.time() - dl_start
+                    if elapsed > 0:
+                        self.speed_signal.emit(downloaded / elapsed / 1024 / 1024)
+                    if total_size:
+                        self.progress_signal.emit(downloaded, total_size)
 
-            # Intercept window.open so we capture the CDN URL without opening a tab
-            page.expose_function('_captureWindowOpen', lambda url: captured.append(url))
-            page.add_init_script("""
-                const _orig = window.open;
-                window.open = function(url, ...args) {
-                    if (url) window._captureWindowOpen(String(url));
-                    return _orig.apply(this, [url, ...args]);
-                };
-            """)
-
-            try:
-                page.goto(page_url, wait_until='domcontentloaded', timeout=30000)
-                page.wait_for_timeout(1500)
-
-                # Try the inline script approach (URL baked into JS on page load)
-                content = page.content()
-                soup = BeautifulSoup(content, 'html.parser')
-                download_url = self._extract_url_from_soup(soup)
-
-                # If not found statically, click the download button to trigger window.open
-                if not download_url:
-                    for selector in [
-                        '#download', '.download-btn', '[id*="download"]',
-                        'a[download]', 'button:text("Download")', 'a:text("Download")',
-                    ]:
-                        try:
-                            btn = page.query_selector(selector)
-                            if btn:
-                                btn.click()
-                                page.wait_for_timeout(2000)
-                                break
-                        except Exception:
-                            continue
-
-                if captured:
-                    download_url = captured[0]
-
-                if not download_url:
-                    raise Exception("Could not find download URL on page")
-
-                file_name = self.extract_filename(soup, link)
-                return file_name, download_url
-
-            finally:
-                browser.close()
+        elapsed = time.time() - dl_start
+        self.log_signal.emit(
+            f"✅ Completed: {file_name}\n"
+            f"   Time: {elapsed:.1f}s  |  Path: {output_path}"
+        )
 
     def download_file(self, url, path):
         """Main download handler with thread safety"""
@@ -426,24 +478,53 @@ class DownloaderWorker(QtCore.QThread):
         while self.should_pause() and self.active:
             time.sleep(0.1)
 
-    def extract_filename(self, soup, fallback_url):
-        """Safe filename extraction"""
-        try:
-            meta_title = soup.find('meta', {'name': 'title'})
-            if meta_title and meta_title['content']:
-                return re.sub(r'[\\/*?:"<>|]', "", meta_title['content'])
-        except Exception as e:
-            pass
-        return os.path.basename(fallback_url).split("?")[0][:120]
 
-    def _extract_url_from_soup(self, soup):
-        """Try to pull the CDN URL out of inline JS without clicking anything."""
-        for script in soup.find_all('script'):
-            text = script.string or ''
-            match = re.search(r'window\.open\(["\']?(https?://[^\s"\')\]]+)', text)
-            if match:
-                return match.group(1)
-        return None
+class URLExportWorker(QtCore.QThread):
+    """Resolves all links to real CDN URLs and writes them to output_links.txt."""
+    log_signal = QtCore.pyqtSignal(str)
+    finished_signal = QtCore.pyqtSignal(str)  # path to output file
+
+    def __init__(self, links, parent=None):
+        super().__init__(parent)
+        self.links = links
+        self.active = True
+
+    def stop(self):
+        self.active = False
+        self.terminate()
+
+    def run(self):
+        self.log_signal.emit(f"🔍 Resolving {len(self.links)} URLs for FDM export...")
+        resolved_urls = []
+
+        def resolve(link):
+            try:
+                _, cdn_url = resolve_cdn_url(link)
+                return cdn_url
+            except Exception as e:
+                self.log_signal.emit(f"❌ Failed: {link[:60]}\n   {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futs = {ex.submit(resolve, lnk): lnk for lnk in self.links}
+            for fut in as_completed(futs):
+                if not self.active:
+                    break
+                cdn = fut.result()
+                if cdn:
+                    resolved_urls.append(cdn)
+                    self.log_signal.emit(f"✅ Resolved: {cdn[:70]}...")
+
+        output_path = os.path.join(os.path.abspath('.'), 'output_links.txt')
+        with open(output_path, 'w') as f:
+            f.write('\n'.join(resolved_urls) + '\n')
+
+        self.log_signal.emit(
+            f"📄 Saved {len(resolved_urls)}/{len(self.links)} URLs → output_links.txt\n"
+            f"   Import this file into Free Download Manager."
+        )
+        self.finished_signal.emit(output_path)
+
 
 class MainWindow(QtWidgets.QMainWindow):
     """
@@ -476,8 +557,15 @@ class MainWindow(QtWidgets.QMainWindow):
         top_button_layout = QtWidgets.QHBoxLayout()
         self.load_btn = QtWidgets.QPushButton("Load Links")
         self.download_btn = QtWidgets.QPushButton("Download All")
+        self.export_fdm_btn = QtWidgets.QPushButton("📋 Export URLs for FDM")
+        self.export_fdm_btn.setObjectName("export_fdm_btn")
+        self.export_fdm_btn.setToolTip(
+            "Resolve all links to real CDN URLs and save to output_links.txt.\n"
+            "Then import that file into Free Download Manager."
+        )
         top_button_layout.addWidget(self.load_btn)
         top_button_layout.addWidget(self.download_btn)
+        top_button_layout.addWidget(self.export_fdm_btn)
         main_layout.addLayout(top_button_layout)
 
         # Main content layout.
@@ -595,6 +683,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Set cursors for interactive elements.
         self.load_btn.setCursor(Qt.PointingHandCursor)
         self.download_btn.setCursor(Qt.PointingHandCursor)
+        self.export_fdm_btn.setCursor(Qt.PointingHandCursor)
         self.pause_btn.setCursor(Qt.PointingHandCursor)
         self.resume_btn.setCursor(Qt.PointingHandCursor)
         self.github_button.setCursor(Qt.PointingHandCursor)
@@ -620,6 +709,9 @@ class MainWindow(QtWidgets.QMainWindow):
             QPushButton#pause_btn:hover { background-color: #FF7043; }
             QPushButton#resume_btn { background-color: #4CAF50; }
             QPushButton#resume_btn:hover { background-color: #66BB6A; }
+            QPushButton#export_fdm_btn { background-color: #7B2FBE; }
+            QPushButton#export_fdm_btn:hover { background-color: #9B4FDE; }
+            QPushButton#export_fdm_btn:disabled { background-color: #4A1F7A; color: #888; }
             QListWidget {
                 background-color: #1E1E1E;
                 color: #FFFFFF;
@@ -650,10 +742,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # Connect button signals.
         self.load_btn.clicked.connect(self.load_links)
         self.download_btn.clicked.connect(self.download_all)
+        self.export_fdm_btn.clicked.connect(self.export_for_fdm)
         self.pause_btn.clicked.connect(self.pause_download)
         self.resume_btn.clicked.connect(self.resume_download)
 
         self.worker = None
+        self.url_export_worker = None
 
     def load_links(self):
         if not os.path.exists(INPUT_FILE):
@@ -741,11 +835,48 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.worker:
             self.worker.stop()
 
+    def export_for_fdm(self):
+        links = []
+        for i in range(self.list_widget.count()):
+            text = self.list_widget.item(i).text()
+            parts = text.split(". ", 1)
+            links.append(parts[1] if len(parts) == 2 else text)
+
+        if not links:
+            QtWidgets.QMessageBox.information(self, "Info", "No links loaded.")
+            return
+
+        if self.url_export_worker and self.url_export_worker.isRunning():
+            self.url_export_worker.stop()
+            self.url_export_worker.wait()
+
+        self.export_fdm_btn.setEnabled(False)
+        self.export_fdm_btn.setText("⏳ Resolving URLs...")
+
+        self.url_export_worker = URLExportWorker(links)
+        self.url_export_worker.log_signal.connect(self.log)
+        self.url_export_worker.finished_signal.connect(self._on_export_done)
+        self.url_export_worker.start()
+
+    def _on_export_done(self, output_path):
+        self.export_fdm_btn.setEnabled(True)
+        self.export_fdm_btn.setText("📋 Export URLs for FDM")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Export Complete",
+            f"URLs saved to:\n{output_path}\n\n"
+            "In Free Download Manager:\n"
+            "  Import → From a text file → select output_links.txt"
+        )
+
     def closeEvent(self, event):
         """Cleanup on window close"""
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(3000)
+        if self.url_export_worker and self.url_export_worker.isRunning():
+            self.url_export_worker.stop()
+            self.url_export_worker.wait(3000)
         event.accept()
 
     def update_file(self, filename):
