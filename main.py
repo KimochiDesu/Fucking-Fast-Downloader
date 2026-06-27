@@ -18,6 +18,8 @@ import webbrowser
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+os.environ.setdefault('QT_API', 'pyqt5')
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -314,31 +316,69 @@ class DownloaderWorker(QtCore.QThread):
                 time.sleep(1.5 ** attempt)
 
     def process_link(self, link):
-        """Safe link processing with error handling"""
+        """Resolve the real CDN download URL using a headless browser.
+        fuckingfast.co requires JS to reveal the URL via window.open()."""
         try:
-            self.log_signal.emit(f"🔗 Processing: {link[:60]}...")
-            
-            # Get file info
-            response = requests.get(link, headers=HEADERS, timeout=30)
-            response.raise_for_status()
-            
-            # Parse content
-            soup = BeautifulSoup(response.text, 'html.parser')
-            file_name = self.extract_filename(soup, link)
-            download_url = self.extract_download_url(soup)
-            
-            # Prepare download
-            output_path = os.path.join(DOWNLOADS_FOLDER, file_name)
-            self.file_signal.emit(file_name)
-            
-            # Start download
-            self.download_file(download_url, output_path)
-            self.link_removed_signal.emit(link)
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            raise Exception(
+                "playwright is not installed.\n"
+                "Run: pip install playwright && playwright install chromium"
+            )
 
-        except Exception as e:
-            self.link_failed_signal.emit(link)
-            self.log_signal.emit(f"❌ Failed: {link}\nError: {str(e)}")
-            raise
+        page_url = link.split('#')[0]  # fragments are never sent to the server
+        captured: list[str] = []
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(user_agent=HEADERS['user-agent'])
+            page = context.new_page()
+
+            # Intercept window.open so we capture the CDN URL without opening a tab
+            page.expose_function('_captureWindowOpen', lambda url: captured.append(url))
+            page.add_init_script("""
+                const _orig = window.open;
+                window.open = function(url, ...args) {
+                    if (url) window._captureWindowOpen(String(url));
+                    return _orig.apply(this, [url, ...args]);
+                };
+            """)
+
+            try:
+                page.goto(page_url, wait_until='domcontentloaded', timeout=30000)
+                page.wait_for_timeout(1500)
+
+                # Try the inline script approach (URL baked into JS on page load)
+                content = page.content()
+                soup = BeautifulSoup(content, 'html.parser')
+                download_url = self._extract_url_from_soup(soup)
+
+                # If not found statically, click the download button to trigger window.open
+                if not download_url:
+                    for selector in [
+                        '#download', '.download-btn', '[id*="download"]',
+                        'a[download]', 'button:text("Download")', 'a:text("Download")',
+                    ]:
+                        try:
+                            btn = page.query_selector(selector)
+                            if btn:
+                                btn.click()
+                                page.wait_for_timeout(2000)
+                                break
+                        except Exception:
+                            continue
+
+                if captured:
+                    download_url = captured[0]
+
+                if not download_url:
+                    raise Exception("Could not find download URL on page")
+
+                file_name = self.extract_filename(soup, link)
+                return file_name, download_url
+
+            finally:
+                browser.close()
 
     def download_file(self, url, path):
         """Main download handler with thread safety"""
@@ -396,14 +436,14 @@ class DownloaderWorker(QtCore.QThread):
             pass
         return os.path.basename(fallback_url).split("?")[0][:120]
 
-    def extract_download_url(self, soup):
-        """Robust URL extraction"""
+    def _extract_url_from_soup(self, soup):
+        """Try to pull the CDN URL out of inline JS without clicking anything."""
         for script in soup.find_all('script'):
-            if 'function download' in script.text:
-                match = re.search(r'window\.open\(["\'](https?://[^\s"\'\)]+)', script.text)
-                if match:
-                    return match.group(1)
-                raise Exception("No download URL found in page scripts")
+            text = script.string or ''
+            match = re.search(r'window\.open\(["\']?(https?://[^\s"\')\]]+)', text)
+            if match:
+                return match.group(1)
+        return None
 
 class MainWindow(QtWidgets.QMainWindow):
     """
