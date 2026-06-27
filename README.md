@@ -136,4 +136,4 @@ Help keep this project updated:
 
 **Disclaimer**: This tool is unofficial and not affiliated with FuckingFast. Always verify game ownership before downloading.
 
-*Original project by [Ritesh Pandit](https://riteshpandit.vercel.app) — forked and extended by [KimochiDesu](https://github.com/KimochiDesu)*
+*Original project by [Ritesh Pandit](https://riteshpandit.vercel.app) — forked and updated by [KimochiDesu](https://github.com/KimochiDesu) using [Claude](https://claude.ai)*
